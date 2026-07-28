@@ -1602,8 +1602,10 @@ def test_cold_start_with_backbone_reports_raw_input_dim() -> None:
     "kwargs, expected_exception, match",
     [
         # Backbone-only knobs are rejected when no backbone is requested.
-        (dict(embedding_dim=8), TypeError, "only apply with a backbone"),
+        (dict(backbone_embedding_dim=8), TypeError, "only apply with a backbone"),
         (dict(backbone_activation="tanh"), TypeError, "only apply with a backbone"),
+        (dict(backbone_l2_anchoring=1.0), TypeError, "only apply with a backbone"),
+        (dict(backbone_lr=0.01), TypeError, "only apply with a backbone"),
         # The shared-backbone path does not support the adaptive window yet.
         (dict(backbone_hidden_dims=_BACKBONE_HIDDEN_DIMS, delta=0.1), ValueError, "adaptive window"),
     ],

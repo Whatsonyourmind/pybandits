@@ -33,7 +33,7 @@ from typing import ClassVar, List, Optional, Tuple
 
 import jax.numpy as jnp
 import numpy as np
-from pydantic import ConfigDict, NonNegativeInt, PositiveInt
+from pydantic import ConfigDict, NonNegativeFloat, NonNegativeInt, PositiveInt
 from typing_extensions import Self
 
 from pybandits.model.bnn._dnn import DNNMixin
@@ -49,6 +49,44 @@ class MLPBackbone(DNNMixin):
     heads supply the decision non-linearity). Point-estimate weights/biases are stored as plain lists
     (``weights``/``biases``) so the model serialises via ``get_state``/``from_state``; numpy views
     (``weight_arrays``/``bias_arrays``) are rebuilt on init for the forward pass.
+
+    Joint-training knobs
+    --------------------
+    Two optional controls read by :class:`~pybandits.meta_model.cmab_meta_model.CmabMetaModel`'s joint
+    SVI engine when this backbone is shared across arms. Both live here (not on the meta-model) because
+    they describe how *this backbone specifically* should behave under repeated joint training — the
+    same reason its weights/biases/architecture live here rather than on the meta-model. Both are
+    no-ops at their defaults, and :meth:`reset` preserves them across a weight re-initialisation (they
+    are training configuration, not trained state).
+
+    * ``l2_anchoring`` — a quadratic penalty (``numpyro.factor``) tying each ``update()`` call's
+      backbone weights *and* biases to their values at the start of that call — the point-estimate
+      analogue of the per-arm heads' own implicit KL-to-previous-posterior anchor, which a deterministic
+      backbone doesn't get for free. This is anchoring / trust-region regularization (pulling toward the
+      *previous update's* value), not standard L2 weight decay (which pulls toward zero) — hence it
+      applies uniformly to every parameter, biases included, rather than excluding biases the way
+      conventional weight decay would. Without it, nothing bounds how far a single ``update()`` call can
+      move the backbone; under continual small-batch updates (e.g. hourly streaming retraining) that
+      unbounded movement compounds and degrades online performance over time, even though any one update
+      looks fine in isolation. ``0.0`` (default) reproduces the exact unanchored behavior. There is no
+      universally-good nonzero value — it trades off against the likelihood term, which scales with
+      batch size and network size, so pick it per deployment (start around ``1e3``-``1e5`` and increase
+      until per-call drift stabilizes without stalling the backbone entirely).
+    * ``lr`` — an independent learning rate for the backbone's parameters during joint SVI, split from
+      the heads' optimizer via ``optax.multi_transform`` (same optimizer type and other
+      ``optimizer_kwargs`` as the heads — only the learning rate differs). ``None`` (default) reproduces
+      the exact prior single-optimizer behavior. ``0.0`` fully freezes the backbone from that point on
+      (its per-step update is architecturally zero, via ``optax.set_to_zero()``, not merely a learning
+      rate scaled down to zero) while the heads keep training against the now-fixed shared embedding — a
+      cheaper in-place alternative to rebuilding a backboneless meta-model by hand, useful e.g. to freeze
+      the backbone once pretraining ends. Empirically, ``l2_anchoring`` alone gives materially better
+      streaming results than any ``lr`` setting (including a hard freeze) at controlling drift without
+      giving up adaptation — prefer it as the primary streaming-drift fix; treat ``lr`` as a secondary,
+      narrower-purpose knob.
+
+    When cold-starting a :class:`~pybandits.meta_model.cmab_meta_model.CmabMetaModel` these are reached
+    via ``backbone_l2_anchoring``/``backbone_lr`` in the cold-start ``kwargs`` (the ``backbone_`` prefix
+    is stripped before forwarding to :meth:`cold_start`), matching ``backbone_hidden_dims`` etc.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -65,6 +103,8 @@ class MLPBackbone(DNNMixin):
     random_seed: Optional[NonNegativeInt] = None
     weights: List[List[List[float]]]  # per layer: (input_dim, output_dim)
     biases: List[List[float]]  # per layer: (output_dim,)
+    l2_anchoring: NonNegativeFloat = 0.0
+    lr: Optional[NonNegativeFloat] = None
 
     # Site-name prefixes for the backbone's deterministic params inside the joint NumPyro model.
     weight_var_name: ClassVar[str] = "backbone_weight"
@@ -72,13 +112,21 @@ class MLPBackbone(DNNMixin):
 
     @property
     def weight_arrays(self) -> List[np.ndarray]:
-        """Per-layer weight matrices as numpy arrays (consumed by the forward pass / joint SVI engine)."""
-        return [np.asarray(w, dtype=float) for w in self.weights]
+        """Per-layer weight matrices as numpy arrays (consumed by the forward pass / joint SVI engine).
+
+        ``float32``, matching the precision every joint-SVI/JAX computation actually runs at (JAX's
+        default) — reading these back at ``float64`` would silently re-introduce precision the training
+        pipeline never had in the first place.
+        """
+        return [np.asarray(w, dtype=np.float32) for w in self.weights]
 
     @property
     def bias_arrays(self) -> List[np.ndarray]:
-        """Per-layer bias vectors as numpy arrays (consumed by the forward pass / joint SVI engine)."""
-        return [np.asarray(b, dtype=float) for b in self.biases]
+        """Per-layer bias vectors as numpy arrays (consumed by the forward pass / joint SVI engine).
+
+        ``float32`` — see :attr:`weight_arrays`.
+        """
+        return [np.asarray(b, dtype=np.float32) for b in self.biases]
 
     @classmethod
     def get_layer_params_name(cls, layer_ind: int) -> Tuple[str, str]:
@@ -175,6 +223,8 @@ class MLPBackbone(DNNMixin):
         embedding_dim: PositiveInt,
         activation: ActivationFunctions = "relu",
         random_seed: Optional[NonNegativeInt] = None,
+        l2_anchoring: NonNegativeFloat = 0.0,
+        lr: Optional[NonNegativeFloat] = None,
     ) -> Self:
         """Initialise an MLP backbone with activation-dependent (He/Xavier) weights and zero biases.
 
@@ -190,6 +240,10 @@ class MLPBackbone(DNNMixin):
             Element-wise activation applied after every layer except the last.
         random_seed : Optional[NonNegativeInt], default=None
             Seed for reproducible initialisation.
+        l2_anchoring : NonNegativeFloat, default=0.0
+            See the class docstring's "Joint-training knobs" section.
+        lr : Optional[NonNegativeFloat], default=None
+            See the class docstring's "Joint-training knobs" section.
 
         Returns
         -------
@@ -205,10 +259,15 @@ class MLPBackbone(DNNMixin):
             random_seed=random_seed,
             weights=[w.tolist() for w in weights],
             biases=[b.tolist() for b in biases],
+            l2_anchoring=l2_anchoring,
+            lr=lr,
         )
 
     def reset(self) -> Self:
         """Return a fresh backbone with the same architecture / seed (weights re-initialised).
+
+        The joint-training knobs (``l2_anchoring``/``lr``) are training configuration, not trained
+        state, so they carry over unchanged — only the weights/biases are re-initialised.
 
         Returns
         -------
@@ -221,6 +280,8 @@ class MLPBackbone(DNNMixin):
             embedding_dim=self.embedding_dim,
             activation=self.activation,
             random_seed=self.random_seed,
+            l2_anchoring=self.l2_anchoring,
+            lr=self.lr,
         )
 
     def embed(self, x: np.ndarray) -> np.ndarray:

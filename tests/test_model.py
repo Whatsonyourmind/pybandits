@@ -1122,7 +1122,7 @@ def test_bnn_vi_update_parameters(
     assert callable(model_fn)
 
     # Optimizer is always set for VI (built from defaults or user override)
-    assert bnn._obj_optimizer is not None
+    assert bnn.obj_optimizer is not None
 
     if "early_stopping_kwargs" in update_kwargs:
         assert bnn._get_early_stopping_callback() is not None
@@ -1275,7 +1275,7 @@ def test_lr_scheduler_valid(
             "lr_scheduler_kwargs": lr_scheduler_kwargs,
         },
     )
-    assert bnn._obj_optimizer is not None
+    assert bnn.obj_optimizer is not None
 
 
 @pytest.mark.parametrize(

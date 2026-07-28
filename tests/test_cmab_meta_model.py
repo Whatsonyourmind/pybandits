@@ -78,12 +78,38 @@ class TestMLPBackbone:
         x = self._context(rng)
         np.testing.assert_allclose(bb.embed(x), restored.embed(x))
 
+    @given(
+        l2_anchoring=st.floats(min_value=0.0, max_value=1e6, allow_nan=False, allow_infinity=False),
+        lr=st.one_of(st.none(), st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False)),
+    )
+    def test_training_knobs_survive_reset_and_serialization(self, l2_anchoring: float, lr: Optional[float]) -> None:
+        """``l2_anchoring``/``lr`` set at ``cold_start`` persist through ``reset`` and JSON round-trip."""
+        bb = MLPBackbone.cold_start(
+            n_features=self.n_features,
+            hidden_dims=self.hidden,
+            embedding_dim=self.embedding_dim,
+            random_seed=self.backbone_seed,
+            l2_anchoring=l2_anchoring,
+            lr=lr,
+        )
+        assert bb.l2_anchoring == l2_anchoring
+        assert bb.lr == lr
+
+        reset_bb = bb.reset()
+        assert reset_bb.l2_anchoring == l2_anchoring
+        assert reset_bb.lr == lr
+
+        restored = MLPBackbone.model_validate_json(bb.model_dump_json())
+        assert restored.l2_anchoring == l2_anchoring
+        assert restored.lr == lr
+
 
 class TestCmabMetaModel:
     """The unified per-arm-heads (+ optional shared backbone) joint-VI meta-model."""
 
     n_features = 6
     hidden = [4]
+    backbone_hidden_dims = [8]
     embedding_dim = 4
     n_rows = 9
     action_ids: Set[ActionId] = {"a", "b", "c"}
@@ -97,6 +123,17 @@ class TestCmabMetaModel:
     # joint-minibatch config: batch_size < minibatch_n engages the single-plate minibatch path.
     minibatch_size = 24
     minibatch_n = 160
+    # MLPBackbone's l2_anchoring / lr test values: disabled (the field defaults), high/low enough to
+    # visibly move the needle, and distinct values for round-trip / kwargs-threading checks.
+    l2_anchoring_disabled = 0.0
+    l2_anchoring_high = 1e6
+    l2_anchoring_serialization_value = 42.0
+    l2_anchoring_cold_start_value = 7.5
+    lr_freeze = 0.0
+    lr_low = 1e-4
+    lr_high = 1e-2
+    lr_serialization_value = 0.002
+    lr_cold_start_value = 0.003
 
     # ----------------------------------------------------------------- helpers / fixtures
     def _head_cold_start_kwargs(self, n_features: int = None) -> dict:
@@ -108,8 +145,19 @@ class TestCmabMetaModel:
             "random_seed": self.meta_seed,
         }
 
-    def _build_meta(self, with_backbone: bool, batch_size: Optional[int] = None) -> CmabMetaModelSO:
-        """Build a meta-model, optionally with a shared backbone and/or a minibatch ``batch_size``."""
+    def _build_meta(
+        self,
+        with_backbone: bool,
+        batch_size: Optional[int] = None,
+        l2_anchoring: float = 0.0,
+        lr: Optional[float] = None,
+    ) -> CmabMetaModelSO:
+        """Build a meta-model, optionally with a shared backbone and/or a minibatch ``batch_size``.
+
+        The backbone training knobs live on the ``MLPBackbone`` itself (see its "Joint-training knobs"
+        docstring section), so they're passed to ``MLPBackbone.cold_start`` here, not to the
+        meta-model's own ``kwargs``.
+        """
         update_kwargs = {"num_steps": self.num_steps}
         if batch_size is not None:
             update_kwargs["batch_size"] = batch_size
@@ -122,9 +170,11 @@ class TestCmabMetaModel:
         if with_backbone:
             kwargs["backbone"] = MLPBackbone.cold_start(
                 n_features=self.n_features,
-                hidden_dims=[8],
+                hidden_dims=self.backbone_hidden_dims,
                 embedding_dim=self.embedding_dim,
                 random_seed=self.backbone_seed,
+                l2_anchoring=l2_anchoring,
+                lr=lr,
             )
         return CmabMetaModelSO(action_ids=self.action_ids, kwargs=kwargs)
 
@@ -155,7 +205,7 @@ class TestCmabMetaModel:
         """Shared-backbone unified meta-model (heads on the embedding)."""
         backbone = MLPBackbone.cold_start(
             n_features=self.n_features,
-            hidden_dims=[8],
+            hidden_dims=self.backbone_hidden_dims,
             embedding_dim=self.embedding_dim,
             random_seed=self.backbone_seed,
         )
@@ -228,6 +278,105 @@ class TestCmabMetaModel:
         assert any(not np.allclose(b, a) for b, a in zip(w_before, meta.backbone.weight_arrays))
         assert not np.allclose(mu_before, self._head_mu(meta, "a"))
 
+    def test_backbone_l2_anchoring_reduces_drift(self, rng: np.random.Generator) -> None:
+        """A positive ``l2_anchoring`` keeps the backbone's weights *and* biases closer to their
+        pre-update values — this is anchoring/trust-region regularization, not standard L2 weight decay,
+        so biases are pulled back just like weights, not excluded.
+        """
+        actions, rewards, context = self._balanced_batch(rng)
+        unanchored = self._build_meta(with_backbone=True, l2_anchoring=self.l2_anchoring_disabled)
+        anchored = self._build_meta(with_backbone=True, l2_anchoring=self.l2_anchoring_high)
+        w_initial = [w.copy() for w in unanchored.backbone.weight_arrays]
+        b_initial = [b.copy() for b in unanchored.backbone.bias_arrays]
+        unanchored.update(actions=actions, rewards=rewards, context=context)
+        anchored.update(actions=actions, rewards=rewards, context=context)
+        drift_unanchored_w = sum(np.sum((a - b) ** 2) for a, b in zip(w_initial, unanchored.backbone.weight_arrays))
+        drift_anchored_w = sum(np.sum((a - b) ** 2) for a, b in zip(w_initial, anchored.backbone.weight_arrays))
+        drift_unanchored_b = sum(np.sum((a - b) ** 2) for a, b in zip(b_initial, unanchored.backbone.bias_arrays))
+        drift_anchored_b = sum(np.sum((a - b) ** 2) for a, b in zip(b_initial, anchored.backbone.bias_arrays))
+        assert drift_anchored_w < drift_unanchored_w
+        assert drift_anchored_b < drift_unanchored_b
+
+    def test_backbone_lr_zero_freezes_backbone_exactly(self, rng: np.random.Generator) -> None:
+        """``lr=0.0`` produces exactly zero backbone movement, while heads still train normally."""
+        actions, rewards, context = self._balanced_batch(rng)
+        meta = self._build_meta(with_backbone=True, lr=self.lr_freeze)
+        w_before = [w.copy() for w in meta.backbone.weight_arrays]
+        mu_before = self._head_mu(meta, "a").copy()
+        meta.update(actions=actions, rewards=rewards, context=context)
+        for before, after in zip(w_before, meta.backbone.weight_arrays):
+            np.testing.assert_array_equal(before, after)
+        assert not np.allclose(mu_before, self._head_mu(meta, "a"))
+
+    def test_backbone_lr_scales_backbone_drift(self, rng: np.random.Generator) -> None:
+        """A smaller ``lr`` produces proportionally less backbone movement, same seed/data."""
+        actions, rewards, context = self._balanced_batch(rng)
+        fast = self._build_meta(with_backbone=True, lr=self.lr_high)
+        slow = self._build_meta(with_backbone=True, lr=self.lr_low)
+        w_initial = [w.copy() for w in fast.backbone.weight_arrays]
+        fast.update(actions=actions, rewards=rewards, context=context)
+        slow.update(actions=actions, rewards=rewards, context=context)
+        drift_fast = sum(np.sum((a - b) ** 2) for a, b in zip(w_initial, fast.backbone.weight_arrays))
+        drift_slow = sum(np.sum((a - b) ** 2) for a, b in zip(w_initial, slow.backbone.weight_arrays))
+        assert drift_slow < drift_fast
+
+    def test_backbone_l2_anchoring_and_lr_compose(self, rng: np.random.Generator) -> None:
+        """Setting both backbone training knobs together doesn't crash and still trains everything."""
+        actions, rewards, context = self._balanced_batch(rng)
+        meta = self._build_meta(with_backbone=True, l2_anchoring=self.l2_anchoring_high, lr=self.lr_low)
+        w_before = [w.copy() for w in meta.backbone.weight_arrays]
+        mu_before = self._head_mu(meta, "a").copy()
+        meta.update(actions=actions, rewards=rewards, context=context)
+        assert any(not np.allclose(b, a) for b, a in zip(w_before, meta.backbone.weight_arrays))
+        assert not np.allclose(mu_before, self._head_mu(meta, "a"))
+
+    @pytest.mark.parametrize(
+        "knob_kwarg",
+        [{"l2_anchoring": l2_anchoring_serialization_value}, {"lr": lr_serialization_value}],
+    )
+    def test_backbone_training_knobs_serialization_round_trip(self, knob_kwarg: dict) -> None:
+        """Backbone training knobs (on the nested ``backbone``) survive a full ``CmabMetaModel`` JSON round trip."""
+        meta = self._build_meta(with_backbone=True, **knob_kwarg)
+        restored = CmabMetaModelSO.model_validate_json(meta.model_dump_json())
+        name, value = next(iter(knob_kwarg.items()))
+        assert getattr(restored.backbone, name) == value
+
+    @pytest.mark.parametrize(
+        "knob_kwarg",
+        [{"l2_anchoring": l2_anchoring_cold_start_value}, {"lr": lr_cold_start_value}],
+    )
+    def test_backbone_training_knobs_reach_backbone_via_cold_start_kwargs(self, knob_kwarg: dict) -> None:
+        """``backbone_``-prefixed cold-start kwargs thread through onto the built ``MLPBackbone``, prefix stripped."""
+        name, value = next(iter(knob_kwarg.items()))
+        kwargs = {
+            "n_features": self.n_features,
+            "hidden_dim_list": self.hidden,
+            "update_kwargs": {"num_steps": self.num_steps},
+            "backbone_hidden_dims": self.backbone_hidden_dims,
+            "backbone_embedding_dim": self.embedding_dim,
+            f"backbone_{name}": value,
+        }
+        meta = CmabMetaModelSO(action_ids=self.valid_subset, kwargs=kwargs)
+        assert getattr(meta.backbone, name) == value
+
+    @pytest.mark.parametrize("knob_name, value", [("l2_anchoring", l2_anchoring_high), ("lr", lr_low)])
+    def test_backbone_training_knobs_require_backbone_hidden_dims(self, knob_name: str, value: float) -> None:
+        """A ``backbone_``-prefixed knob passed via cold-start kwargs without ``backbone_hidden_dims`` raises.
+
+        There's no ``CmabMetaModel``-level field for these knobs to set without a backbone anymore (they
+        live on ``MLPBackbone``), so the only way to misuse them is via the cold-start kwargs bag without
+        requesting a backbone at all — the same ``TypeError`` ``backbone_embedding_dim``/
+        ``backbone_activation`` already raise in that situation.
+        """
+        kwargs = {
+            "n_features": self.n_features,
+            "hidden_dim_list": self.hidden,
+            "update_kwargs": {"num_steps": self.num_steps},
+            f"backbone_{knob_name}": value,
+        }
+        with pytest.raises(TypeError, match="only apply with a backbone"):
+            CmabMetaModelSO(action_ids=self.valid_subset, kwargs=kwargs)
+
     def test_reset_restores_backbone(self, meta_backbone: CmabMetaModelSO, rng: np.random.Generator) -> None:
         """``reset`` restores the backbone (same seed) after an update."""
         w_initial = [w.copy() for w in meta_backbone.backbone.weight_arrays]
@@ -278,7 +427,7 @@ class TestCmabMetaModel:
         if with_backbone:
             head_kwargs["backbone"] = MLPBackbone.cold_start(
                 n_features=self.n_features,
-                hidden_dims=[8],
+                hidden_dims=self.backbone_hidden_dims,
                 embedding_dim=self.embedding_dim,
                 random_seed=self.backbone_seed,
             )
@@ -320,7 +469,7 @@ class TestCmabMetaModel:
             "hidden_dim_list": self.hidden,
             "update_kwargs": {"method": "fullrank_advi"},
             "backbone_hidden_dims": self.hidden,
-            "embedding_dim": self.embedding_dim,
+            "backbone_embedding_dim": self.embedding_dim,
         }
         with pytest.raises(NotImplementedError, match="advi"):
             CmabMetaModelSO(action_ids=self.valid_subset, kwargs=kwargs)
@@ -382,7 +531,7 @@ class TestCmabMetaModel:
             "random_seed": self.meta_seed,
             "backbone": MLPBackbone.cold_start(
                 n_features=self.n_features,
-                hidden_dims=[8],
+                hidden_dims=self.backbone_hidden_dims,
                 embedding_dim=self.embedding_dim,
                 random_seed=self.backbone_seed,
             ),

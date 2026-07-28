@@ -262,6 +262,11 @@ class BaseBayesianNeuralNetwork(Model, DNNMixin, ABC):
     def approx_history(self) -> Optional[np.ndarray]:
         return self._approx_history
 
+    @property
+    def obj_optimizer(self) -> Any:
+        """The optax optimizer built from ``update_kwargs``, wrapped via ``optax_to_numpyro``."""
+        return self._obj_optimizer
+
     def _prepare_context_arrays(self, context: np.ndarray) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
         """
         Split a numpy context array into numerical and categorical index arrays.
